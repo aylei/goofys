@@ -341,6 +341,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		DebugFuse:  c.Bool("debug_fuse"),
 		DebugS3:    c.Bool("debug_s3"),
 		Foreground: c.Bool("f"),
+		LogFile:    c.String("log-file"),
 	}
 
 	// S3
