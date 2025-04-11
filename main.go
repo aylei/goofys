@@ -180,7 +180,7 @@ func main() {
 				panic(fmt.Sprintf("unable to daemonize: %v", err))
 			}
 
-			InitLoggers(!flags.Foreground && child == nil)
+			InitLoggers(flags.LogFile, !flags.Foreground && child == nil)
 
 			if child != nil {
 				// attempt to wait for child to notify parent
@@ -198,7 +198,8 @@ func main() {
 			}
 
 		} else {
-			InitLoggers(!flags.Foreground)
+			// foreground mode, never log to syslog
+			InitLoggers(flags.LogFile, false)
 		}
 
 		// Mount the file system.

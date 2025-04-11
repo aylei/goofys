@@ -55,6 +55,8 @@ type FlagStorage struct {
 	DebugFuse  bool
 	DebugS3    bool
 	Foreground bool
+	// If specified, log to a file instead of syslog
+	LogFile string
 }
 
 func (flags *FlagStorage) GetMimeType(fileName string) (retMime *string) {
