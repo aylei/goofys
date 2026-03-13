@@ -28,7 +28,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"errors"
+
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -541,8 +544,9 @@ func mapAwsError(err error) error {
 		return nil
 	}
 
-	if awsErr, ok := err.(awserr.Error); ok {
-		switch awsErr.Code() {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
 		case "BucketRegionError":
 			// don't need to log anything, we should detect region after
 			return err
@@ -552,21 +556,22 @@ func mapAwsError(err error) error {
 			return fuse.EEXIST
 		}
 
-		if reqErr, ok := err.(awserr.RequestFailure); ok {
+		var respErr *smithyhttp.ResponseError
+		if errors.As(err, &respErr) {
 			// A service error occurred
-			err = mapHttpError(reqErr.StatusCode())
-			if err != nil {
-				return err
+			httpErr := mapHttpError(respErr.Response.StatusCode)
+			if httpErr != nil {
+				return httpErr
 			} else {
-				s3Log.Errorf("http=%v %v s3=%v request=%v\n",
-					reqErr.StatusCode(), reqErr.Message(),
-					awsErr.Code(), reqErr.RequestID())
-				return reqErr
+				s3Log.Errorf("http=%v %v s3=%v\n",
+					respErr.Response.StatusCode, apiErr.ErrorMessage(),
+					apiErr.ErrorCode())
+				return respErr
 			}
 		} else {
-			// Generic AWS Error with Code, Message, and original error (if any)
-			s3Log.Errorf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
-			return awsErr
+			// Generic AWS Error with Code and Message
+			s3Log.Errorf("code=%v msg=%v, err=%v\n", apiErr.ErrorCode(), apiErr.ErrorMessage(), err)
+			return apiErr
 		}
 	} else {
 		return err

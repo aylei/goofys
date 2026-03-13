@@ -15,16 +15,17 @@
 package common
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"net/http"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 type S3Config struct {
@@ -51,13 +52,13 @@ type S3Config struct {
 
 	Subdomain bool
 
-	Credentials *credentials.Credentials
-	Session     *session.Session
+	Credentials aws.CredentialsProvider
+	AwsCfg      *aws.Config
 
 	BucketOwner string
 }
 
-var s3Session *session.Session
+var s3AwsCfg *aws.Config
 
 func (c *S3Config) Init() *S3Config {
 	if c.Region == "" {
@@ -69,61 +70,70 @@ func (c *S3Config) Init() *S3Config {
 	return c
 }
 
-func (c *S3Config) ToAwsConfig(flags *FlagStorage) (*aws.Config, error) {
-	awsConfig := (&aws.Config{
-		Region: &c.Region,
-		Logger: GetLogger("s3"),
-	}).WithHTTPClient(&http.Client{
+func (c *S3Config) ToAwsConfig(flags *FlagStorage) (aws.Config, error) {
+	var optFns []func(*config.LoadOptions) error
+
+	optFns = append(optFns, config.WithRegion(c.Region))
+	optFns = append(optFns, config.WithHTTPClient(&http.Client{
 		Transport: &defaultHTTPTransport,
 		Timeout:   flags.HTTPTimeout,
-	})
-	if flags.DebugS3 {
-		awsConfig.LogLevel = aws.LogLevel(aws.LogDebug | aws.LogDebugWithRequestErrors)
+	}))
+
+	if c.Profile != "" {
+		optFns = append(optFns, config.WithSharedConfigProfile(c.Profile))
 	}
 
 	if c.Credentials == nil {
 		if c.AccessKey != "" {
-			c.Credentials = credentials.NewStaticCredentials(c.AccessKey, c.SecretKey, "")
+			c.Credentials = credentials.NewStaticCredentialsProvider(c.AccessKey, c.SecretKey, "")
 		}
-	}
-	if flags.Endpoint != "" {
-		awsConfig.Endpoint = &flags.Endpoint
-	}
-
-	awsConfig.S3ForcePathStyle = aws.Bool(!c.Subdomain)
-
-	if c.Session == nil {
-		if s3Session == nil {
-			var err error
-			s3Session, err = session.NewSessionWithOptions(session.Options{
-				Profile:           c.Profile,
-				SharedConfigState: session.SharedConfigEnable,
-			})
-			if err != nil {
-				return nil, err
-			}
-		}
-		c.Session = s3Session
-	}
-
-	if c.RoleArn != "" {
-		c.Credentials = stscreds.NewCredentials(stsConfigProvider{c}, c.RoleArn,
-			func(p *stscreds.AssumeRoleProvider) {
-				if c.RoleExternalId != "" {
-					p.ExternalID = &c.RoleExternalId
-				}
-				p.RoleSessionName = c.RoleSessionName
-			})
 	}
 
 	if c.Credentials != nil {
-		awsConfig.Credentials = c.Credentials
+		optFns = append(optFns, config.WithCredentialsProvider(c.Credentials))
+	}
+
+	if c.AwsCfg == nil {
+		if s3AwsCfg == nil {
+			cfg, err := config.LoadDefaultConfig(context.TODO(), optFns...)
+			if err != nil {
+				return aws.Config{}, err
+			}
+			s3AwsCfg = &cfg
+		}
+		c.AwsCfg = s3AwsCfg
+	}
+
+	awsCfg := *c.AwsCfg
+
+	if flags.DebugS3 {
+		awsCfg.ClientLogMode = aws.LogRequest | aws.LogResponse
+	}
+
+	if c.RoleArn != "" {
+		stsCfg := awsCfg
+		if c.Credentials != nil {
+			stsCfg.Credentials = c.Credentials
+		}
+		stsClient := sts.NewFromConfig(stsCfg, func(o *sts.Options) {
+			if c.StsEndpoint != "" {
+				o.BaseEndpoint = &c.StsEndpoint
+			}
+		})
+		c.Credentials = stscreds.NewAssumeRoleProvider(stsClient, c.RoleArn,
+			func(o *stscreds.AssumeRoleOptions) {
+				if c.RoleExternalId != "" {
+					o.ExternalID = &c.RoleExternalId
+				}
+				o.RoleSessionName = c.RoleSessionName
+			})
+		awsCfg.Credentials = c.Credentials
 	}
 
 	if c.SseC != "" {
 		key, err := base64.StdEncoding.DecodeString(c.SseC)
 		if err != nil {
-			return nil, fmt.Errorf("sse-c is not base64-encoded: %v", err)
+			return aws.Config{}, fmt.Errorf("sse-c is not base64-encoded: %v", err)
 		}
 
 		c.SseC = string(key)
@@ -131,21 +141,5 @@ func (c *S3Config) ToAwsConfig(flags *FlagStorage) (*aws.Config, error) {
 		c.SseCDigest = base64.StdEncoding.EncodeToString(m[:])
 	}
 
-	return awsConfig, nil
-}
-
-type stsConfigProvider struct {
-	*S3Config
-}
-
-func (c stsConfigProvider) ClientConfig(serviceName string, cfgs ...*aws.Config) client.Config {
-	config := c.Session.ClientConfig(serviceName, cfgs...)
-	if c.Credentials != nil {
-		config.Config.Credentials = c.Credentials
-	}
-	if c.StsEndpoint != "" {
-		config.Endpoint = c.StsEndpoint
-	}
-
-	return config
+	return awsCfg, nil
 }
