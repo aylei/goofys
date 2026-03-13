@@ -1,5 +1,9 @@
 export CGO_ENABLED=0
 
+VERSION := aylei_$(shell git rev-parse HEAD)
+LDFLAGS := -X main.Version=$(VERSION)
+BINARY := goofys
+
 run-test: s3proxy.jar
 	./test/run-tests.sh
 
@@ -10,7 +14,15 @@ get-deps: s3proxy.jar
 	go get -t ./...
 
 build:
-	go build -ldflags "-X main.Version=aylei_`git rev-parse HEAD`"
+	go build -ldflags "$(LDFLAGS)"
+
+build-amd64:
+	GOARCH=amd64 GOOS=linux go build -ldflags "$(LDFLAGS)" -o $(BINARY)-linux-amd64
+
+build-arm64:
+	GOARCH=arm64 GOOS=linux go build -ldflags "$(LDFLAGS)" -o $(BINARY)-linux-arm64
+
+build-all: build-amd64 build-arm64
 
 install:
-	go install -ldflags "-X main.Version=aylei_`git rev-parse HEAD`"
+	go install -ldflags "$(LDFLAGS)"
