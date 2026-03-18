@@ -17,14 +17,15 @@ package internal
 import (
 	. "github.com/kahing/goofys/api/common"
 
+	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
-
-	"github.com/aws/aws-sdk-go/service/s3"
 
 	"github.com/jacobsa/fuse"
 )
@@ -82,42 +83,72 @@ func (s *GCS3) DeleteBlobs(param *DeleteBlobsInput) (*DeleteBlobsOutput, error) 
 }
 
 func (s *GCS3) MultipartBlobBegin(param *MultipartBlobBeginInput) (*MultipartBlobCommitInput, error) {
-	mpu := s3.CreateMultipartUploadInput{
-		Bucket:       &s.bucket,
-		Key:          &param.Key,
-		StorageClass: &s.config.StorageClass,
-		ContentType:  param.ContentType,
+	// GCS resumable upload: we need to manipulate the request extensively
+	// (clear query params, set x-goog-resumable, read Location header),
+	// so we use raw HTTP with v2 signing instead of the SDK client.
+
+	// Build the URL for the object
+	endpoint := s.flags.Endpoint
+	if endpoint == "" {
+		endpoint = "https://storage.googleapis.com"
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	u.Path = "/" + s.bucket + "/" + param.Key
+
+	httpReq, err := http.NewRequestWithContext(context.TODO(), "POST", u.String(), nil)
+	if err != nil {
+		return nil, err
 	}
 
+	httpReq.Header.Set("x-goog-resumable", "start")
+	if param.ContentType != nil {
+		httpReq.Header.Set("Content-Type", *param.ContentType)
+	}
+	if s.config.StorageClass != "" {
+		httpReq.Header.Set("x-goog-storage-class", s.config.StorageClass)
+	}
 	if s.config.UseSSE {
-		mpu.ServerSideEncryption = &s.sseType
+		sseType := string(s.sseType)
+		httpReq.Header.Set("x-amz-server-side-encryption", sseType)
 		if s.config.UseKMS && s.config.KMSKeyID != "" {
-			mpu.SSEKMSKeyId = &s.config.KMSKeyID
+			httpReq.Header.Set("x-amz-server-side-encryption-aws-kms-key-id", s.config.KMSKeyID)
 		}
 	}
-
 	if s.config.ACL != "" {
-		mpu.ACL = &s.config.ACL
+		httpReq.Header.Set("x-goog-acl", s.config.ACL)
 	}
 
-	req, _ := s.CreateMultipartUploadRequest(&mpu)
-	// v4 signing of this fails
-	s.setV2Signer(&req.Handlers)
-	// get rid of ?uploads=
-	req.HTTPRequest.URL.RawQuery = ""
-	req.HTTPRequest.Header.Set("x-goog-resumable", "start")
+	// Sign with v2 signer
+	creds, err := s.awsCfg.Credentials.Retrieve(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+	err = signV2Request(httpReq, creds, !s.config.Subdomain)
+	if err != nil {
+		return nil, err
+	}
 
-	err := req.Send()
+	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		s3Log.Errorf("CreateMultipartUpload %v = %v", param.Key, err)
-		return nil, mapAwsError(err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		s3Log.Errorf("CreateMultipartUpload %v = %v %v", param.Key, resp.StatusCode, string(body))
+		return nil, fmt.Errorf("GCS resumable upload init failed: %v", resp.Status)
 	}
 
-	location := req.HTTPResponse.Header.Get("Location")
+	location := resp.Header.Get("Location")
 	_, err = url.Parse(location)
 	if err != nil {
 		s3Log.Errorf("CreateMultipartUpload %v %v = %v", param.Key, location, err)
-		return nil, mapAwsError(err)
+		return nil, err
 	}
 
 	return &MultipartBlobCommitInput{
@@ -136,21 +167,14 @@ func (s *GCS3) uploadPart(param *MultipartBlobAddInput, totalSize uint64, last b
 		defer closer.Close()
 	}
 
-	// the mpuId serves as authentication token so
-	// technically we don't need to sign this anymore and
-	// can just use a plain HTTP request, but going
-	// through aws-sdk-go anyway to get retry handling
-	params := &s3.PutObjectInput{
-		Bucket: &s.bucket,
-		Key:    param.Commit.Key,
-		Body:   param.Body,
+	// The resumable upload URL (UploadId) serves as the authentication token,
+	// so we use raw HTTP - no signing needed.
+	uploadURL := *param.Commit.UploadId
+
+	httpReq, err := http.NewRequestWithContext(context.TODO(), "PUT", uploadURL, param.Body)
+	if err != nil {
+		return nil, err
 	}
-
-	s3Log.Debug(params)
-
-	req, resp := s.PutObjectRequest(params)
-	req.Handlers.Sign.Clear()
-	req.HTTPRequest.URL, _ = url.Parse(*param.Commit.UploadId)
 
 	start := totalSize - param.Size
 	end := totalSize - 1
@@ -163,21 +187,30 @@ func (s *GCS3) uploadPart(param *MultipartBlobAddInput, totalSize uint64, last b
 
 	contentRange := fmt.Sprintf("bytes %v-%v/%v", start, end, size)
 
-	req.HTTPRequest.Header.Set("Content-Length", strconv.FormatUint(param.Size, 10))
-	req.HTTPRequest.Header.Set("Content-Range", contentRange)
+	httpReq.Header.Set("Content-Length", strconv.FormatUint(param.Size, 10))
+	httpReq.Header.Set("Content-Range", contentRange)
+	httpReq.ContentLength = int64(param.Size)
 
-	err = req.Send()
+	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
+		err = mapAwsError(err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 308 {
 		// status indicating that we need more parts to finish this
-		if req.HTTPResponse.StatusCode == 308 {
-			err = nil
-		} else {
-			err = mapAwsError(err)
-			return
-		}
+		return nil, nil
+	} else if resp.StatusCode >= 400 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		err = fmt.Errorf("GCS upload part failed: %v %v", resp.Status, string(body))
+		return
 	}
 
-	etag = resp.ETag
+	etagVal := resp.Header.Get("ETag")
+	if etagVal != "" {
+		etag = &etagVal
+	}
 
 	return
 }
@@ -229,3 +262,4 @@ func (s *GCS3) MultipartBlobCommit(param *MultipartBlobCommitInput) (*MultipartB
 		ETag: etag,
 	}, nil
 }
+

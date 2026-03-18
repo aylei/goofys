@@ -40,9 +40,8 @@ import (
 
 	"context"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/corehandlers"
-	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3pkg "github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest"
@@ -500,11 +499,10 @@ func (s *GoofysTest) SetUpTest(t *C) {
 		}
 
 		if s.emulator {
-			s3.Handlers.Sign.Clear()
-			s3.Handlers.Sign.PushBack(SignV2)
-			s3.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
+			s3.v2Signer = true
+			s3.newS3()
 		}
-		_, err = s3.ListBuckets(nil)
+		_, err = s3.client.ListBuckets(context.TODO(), &s3pkg.ListBucketsInput{})
 		t.Assert(err, IsNil)
 
 	} else if cloud == "gcs3" {
@@ -2029,7 +2027,7 @@ func (s *GoofysTest) anonymous(t *C) {
 	s3, ok = cloud.Delegate().(*S3Backend)
 	t.Assert(ok, Equals, true)
 
-	s3.awsConfig.Credentials = credentials.AnonymousCredentials
+	s3.awsCfg.Credentials = aws.AnonymousCredentials{}
 	s3.newS3()
 }
 
@@ -2940,7 +2938,7 @@ func (s *GoofysTest) TestRead403(t *C) {
 	fh, err := in.OpenFile(fuseops.OpMetadata{uint32(os.Getpid())})
 	t.Assert(err, IsNil)
 
-	s3.awsConfig.Credentials = credentials.AnonymousCredentials
+	s3.awsCfg.Credentials = aws.AnonymousCredentials{}
 	s3.newS3()
 
 	// fake enable read-ahead
@@ -3338,9 +3336,8 @@ func (s *GoofysTest) newBackend(t *C, bucket string, createBucket bool) (cloud S
 		s3.aws = hasEnv("AWS")
 
 		if s.emulator {
-			s3.Handlers.Sign.Clear()
-			s3.Handlers.Sign.PushBack(SignV2)
-			s3.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
+			s3.v2Signer = true
+			s3.newS3()
 		}
 
 		if s3.aws {

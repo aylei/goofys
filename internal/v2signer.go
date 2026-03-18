@@ -15,10 +15,10 @@
 package internal
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -26,14 +26,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/private/protocol/rest"
-)
-
-var (
-	errInvalidMethod = errors.New("v2 signer does not handle HTTP POST")
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 const (
@@ -61,79 +56,102 @@ var subresources = []string{
 	"website",
 }
 
-type signer struct {
-	// Values that must be populated from the request
-	Request     *http.Request
-	Time        time.Time
-	Credentials *credentials.Credentials
-	Debug       aws.LogLevelType
-	Logger      aws.Logger
+// escapePath percent-encodes a URL path, preserving forward slashes.
+func escapePath(path string, encodeSep bool) string {
+	var buf strings.Builder
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		if c == '/' && !encodeSep {
+			buf.WriteByte(c)
+		} else if isValidPathByte(c) {
+			buf.WriteByte(c)
+		} else {
+			fmt.Fprintf(&buf, "%%%02X", c)
+		}
+	}
+	return buf.String()
+}
+
+func isValidPathByte(c byte) bool {
+	if c >= 'A' && c <= 'Z' {
+		return true
+	}
+	if c >= 'a' && c <= 'z' {
+		return true
+	}
+	if c >= '0' && c <= '9' {
+		return true
+	}
+	switch c {
+	case '-', '_', '.', '~':
+		return true
+	}
+	return false
+}
+
+type v2SigningMiddleware struct {
+	credentials aws.CredentialsProvider
 	pathStyle   bool
-	bucket      string
-
-	Query        url.Values
-	stringToSign string
-	signature    string
 }
 
-// Sign requests with signature version 2.
-//
-// Will sign the requests with the service config's Credentials object
-// Signing is skipped if the credentials is the credentials.AnonymousCredentials
-// object.
-func SignV2(req *request.Request) {
-	// If the request does not need to be signed ignore the signing of the
-	// request if the AnonymousCredentials object is used.
-	if req.Config.Credentials == credentials.AnonymousCredentials {
-		return
+func (m *v2SigningMiddleware) ID() string { return "V2Signer" }
+
+func (m *v2SigningMiddleware) HandleFinalize(
+	ctx context.Context,
+	in middleware.FinalizeInput,
+	next middleware.FinalizeHandler,
+) (middleware.FinalizeOutput, middleware.Metadata, error) {
+	req, ok := in.Request.(*smithyhttp.Request)
+	if !ok {
+		return next.HandleFinalize(ctx, in)
 	}
 
-	v2 := signer{
-		Request:     req.HTTPRequest,
-		Time:        req.Time,
-		Credentials: req.Config.Credentials,
-		Debug:       req.Config.LogLevel.Value(),
-		Logger:      req.Config.Logger,
-		pathStyle:   aws.BoolValue(req.Config.S3ForcePathStyle),
-	}
-
-	req.Error = v2.Sign()
-}
-
-func (v2 *signer) Sign() error {
-	credValue, err := v2.Credentials.Get()
+	// Skip signing for anonymous credentials
+	creds, err := m.credentials.Retrieve(ctx)
 	if err != nil {
-		return err
+		return middleware.FinalizeOutput{}, middleware.Metadata{}, err
+	}
+	if creds.AccessKeyID == "" && creds.SecretAccessKey == "" {
+		return next.HandleFinalize(ctx, in)
 	}
 
-	v2.Query = v2.Request.URL.Query()
+	err = signV2Request(req.Request, creds, m.pathStyle)
+	if err != nil {
+		return middleware.FinalizeOutput{}, middleware.Metadata{}, err
+	}
 
-	contentMD5 := v2.Request.Header.Get("Content-MD5")
-	contentType := v2.Request.Header.Get("Content-Type")
-	date := v2.Time.UTC().Format(timeFormat)
-	v2.Request.Header.Set("x-amz-date", date)
+	return next.HandleFinalize(ctx, in)
+}
 
-	if credValue.SessionToken != "" {
-		v2.Request.Header.Set("x-amz-security-token", credValue.SessionToken)
+func signV2Request(httpReq *http.Request, creds aws.Credentials, pathStyle bool) error {
+	query := httpReq.URL.Query()
+
+	contentMD5 := httpReq.Header.Get("Content-MD5")
+	contentType := httpReq.Header.Get("Content-Type")
+	date := time.Now().UTC().Format(timeFormat)
+	httpReq.Header.Set("x-amz-date", date)
+
+	if creds.SessionToken != "" {
+		httpReq.Header.Set("x-amz-security-token", creds.SessionToken)
 	}
 
 	// in case this is a retry, ensure no signature present
-	v2.Request.Header.Del("Authorization")
+	httpReq.Header.Del("Authorization")
 
-	method := v2.Request.Method
+	method := httpReq.Method
 
-	uri := v2.Request.URL.Opaque
+	uri := httpReq.URL.Opaque
 	if uri != "" {
 		if questionMark := strings.Index(uri, "?"); questionMark != -1 {
 			uri = uri[0:questionMark]
 		}
 		uri = "/" + strings.Join(strings.Split(uri, "/")[3:], "/")
 	} else {
-		uri = v2.Request.URL.Path
+		uri = httpReq.URL.Path
 	}
-	path := rest.EscapePath(uri, false)
-	if !v2.pathStyle {
-		host := strings.SplitN(v2.Request.URL.Host, ".", 2)[0]
+	path := escapePath(uri, false)
+	if !pathStyle {
+		host := strings.SplitN(httpReq.URL.Host, ".", 2)[0]
 		path = "/" + host + uri
 	}
 	if path == "" {
@@ -143,9 +161,9 @@ func (v2 *signer) Sign() error {
 	// build URL-encoded query keys and values
 	queryKeysAndValues := []string{}
 	for _, key := range subresources {
-		if _, ok := v2.Query[key]; ok {
+		if _, ok := query[key]; ok {
 			k := strings.Replace(url.QueryEscape(key), "+", "%20", -1)
-			v := strings.Replace(url.QueryEscape(v2.Query.Get(key)), "+", "%20", -1)
+			v := strings.Replace(url.QueryEscape(query.Get(key)), "+", "%20", -1)
 			if v != "" {
 				v = "=" + v
 			}
@@ -154,10 +172,10 @@ func (v2 *signer) Sign() error {
 	}
 
 	// join into one query string
-	query := strings.Join(queryKeysAndValues, "&")
+	queryStr := strings.Join(queryKeysAndValues, "&")
 
-	if query != "" {
-		path += "?" + query
+	if queryStr != "" {
+		path += "?" + queryStr
 	}
 
 	tmp := []string{
@@ -168,7 +186,7 @@ func (v2 *signer) Sign() error {
 	}
 
 	var headers []string
-	for k := range v2.Request.Header {
+	for k := range httpReq.Header {
 		k = strings.ToLower(k)
 		if strings.HasPrefix(k, "x-amz-") {
 			headers = append(headers, k)
@@ -177,36 +195,39 @@ func (v2 *signer) Sign() error {
 	sort.Strings(headers)
 
 	for _, k := range headers {
-		v := strings.Join(v2.Request.Header[http.CanonicalHeaderKey(k)], ",")
+		v := strings.Join(httpReq.Header[http.CanonicalHeaderKey(k)], ",")
 		tmp = append(tmp, k+":"+v)
 	}
 
 	tmp = append(tmp, path)
 
 	// build the canonical string for the V2 signature
-	v2.stringToSign = strings.Join(tmp, "\n")
+	stringToSign := strings.Join(tmp, "\n")
 
-	hash := hmac.New(sha1.New, []byte(credValue.SecretAccessKey))
-	hash.Write([]byte(v2.stringToSign))
-	v2.signature = base64.StdEncoding.EncodeToString(hash.Sum(nil))
-	v2.Request.Header.Set("Authorization",
-		"AWS "+credValue.AccessKeyID+":"+v2.signature)
-
-	if v2.Debug.Matches(aws.LogDebugWithSigning) {
-		v2.logSigningInfo()
-	}
+	hash := hmac.New(sha1.New, []byte(creds.SecretAccessKey))
+	hash.Write([]byte(stringToSign))
+	signature := base64.StdEncoding.EncodeToString(hash.Sum(nil))
+	httpReq.Header.Set("Authorization",
+		"AWS "+creds.AccessKeyID+":"+signature)
 
 	return nil
 }
 
-const logSignInfoMsg = `DEBUG: Request Signature:
----[ STRING TO SIGN ]--------------------------------
-%s
----[ SIGNATURE ]-------------------------------------
-%s
------------------------------------------------------`
-
-func (v2 *signer) logSigningInfo() {
-	msg := fmt.Sprintf(logSignInfoMsg, v2.stringToSign, v2.Request.Header.Get("Authorization"))
-	v2.Logger.Log(msg)
+// V2SignerMiddleware returns a function that adds v2 signing middleware
+// to the smithy middleware stack, replacing the default v4 signer.
+func V2SignerMiddleware(creds aws.CredentialsProvider, pathStyle bool) func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		// Remove default v4 signer
+		_, err := stack.Finalize.Remove("Signing")
+		if err != nil {
+			// Signer might not exist yet, that's ok
+		}
+		// Also try to remove the v4a signer
+		_, _ = stack.Finalize.Remove("SigV4SignHTTPRequestMiddleware")
+		// Add v2 signer
+		return stack.Finalize.Add(&v2SigningMiddleware{
+			credentials: creds,
+			pathStyle:   pathStyle,
+		}, middleware.After)
+	}
 }
